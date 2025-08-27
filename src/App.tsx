@@ -82,12 +82,14 @@ function App() {
       mediaRecorderRef.current = new MediaRecorder(stream);
 
       mediaRecorderRef.current.ondataavailable = (event) => {
-        audioChunksRef.current.push(event.data);
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
       };
 
       mediaRecorderRef.current.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-        if (analysisData) {
+        if (audioChunksRef.current.length > 0) {
+          const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
           setAnalysisData(prev => prev ? { ...prev, audioBlob } : null);
         }
       };
@@ -239,7 +241,9 @@ function App() {
     // Generate frequency data (simulated for demo)
     const frequencyData = Array.from({ length: 50 }, () => Math.random() * 100);
 
-    const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+    const audioBlob = audioChunksRef.current.length > 0 
+      ? new Blob(audioChunksRef.current, { type: 'audio/webm' })
+      : undefined;
 
     const analysis: AnalysisData = {
       transcription: currentTranscription,
@@ -267,7 +271,7 @@ function App() {
         audioRef.current.currentTime = 0;
       }
       if (playbackContextRef.current) {
-        playbackContextRef.current.close();
+        await playbackContextRef.current.close();
       }
       setIsPlaying(false);
       setPlaybackTime(0);
@@ -277,14 +281,22 @@ function App() {
     try {
       // Create audio element
       const audioUrl = URL.createObjectURL(analysisData.audioBlob);
-      if (audioRef.current) {
-        audioRef.current.src = audioUrl;
-      } else {
-        audioRef.current = new Audio(audioUrl);
-      }
+      
+      // Create new audio element each time to avoid issues
+      audioRef.current = new Audio(audioUrl);
 
       // Setup audio context for playback visualization
-      playbackContextRef.current = new AudioContext();
+      if (playbackContextRef.current) {
+        await playbackContextRef.current.close();
+      }
+      
+      playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      
+      // Resume context if suspended
+      if (playbackContextRef.current.state === 'suspended') {
+        await playbackContextRef.current.resume();
+      }
+      
       const source = playbackContextRef.current.createMediaElementSource(audioRef.current);
       playbackAnalyserRef.current = playbackContextRef.current.createAnalyser();
       playbackAnalyserRef.current.fftSize = 256;
@@ -295,15 +307,19 @@ function App() {
       audioRef.current.onended = () => {
         setIsPlaying(false);
         setPlaybackTime(0);
-        if (playbackContextRef.current) {
-          playbackContextRef.current.close();
-        }
+        URL.revokeObjectURL(audioUrl);
       };
 
       audioRef.current.ontimeupdate = () => {
         if (audioRef.current) {
           setPlaybackTime(audioRef.current.currentTime);
         }
+      };
+
+      audioRef.current.onerror = (error) => {
+        console.error('Audio playback error:', error);
+        setIsPlaying(false);
+        alert('Error al reproducir el audio. Intenta grabar de nuevo.');
       };
 
       await audioRef.current.play();
@@ -314,6 +330,8 @@ function App() {
 
     } catch (error) {
       console.error('Error playing audio:', error);
+      setIsPlaying(false);
+      alert('No se pudo reproducir el audio. Verifica que el navegador soporte la reproducción.');
     }
   };
 
@@ -343,46 +361,78 @@ function App() {
   const saveSession = () => {
     if (!analysisData) return;
 
-    const sessionName = `Session_${new Date().toLocaleString('es-ES', {
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    }).replace(/[/:]/g, '-')}`;
+    try {
+      const now = new Date();
+      const sessionName = `Session_${now.getDate().toString().padStart(2, '0')}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getFullYear()}_${now.getHours().toString().padStart(2, '0')}-${now.getMinutes().toString().padStart(2, '0')}`;
 
-    const newSession: SavedSession = {
-      id: analysisData.id,
-      name: sessionName,
-      timestamp: analysisData.timestamp,
-      data: analysisData
-    };
+      // Create a copy of analysis data without the audio blob for storage
+      const dataForStorage = {
+        ...analysisData,
+        audioBlob: undefined // Remove blob to avoid storage issues
+      };
 
-    const updatedSessions = [...savedSessions, newSession];
-    setSavedSessions(updatedSessions);
-    localStorage.setItem('voiceAnalyzerSessions', JSON.stringify(updatedSessions));
+      const newSession: SavedSession = {
+        id: analysisData.id,
+        name: sessionName,
+        timestamp: analysisData.timestamp,
+        data: dataForStorage
+      };
+
+      const updatedSessions = [...savedSessions, newSession];
+      setSavedSessions(updatedSessions);
+      
+      // Save to localStorage with error handling
+      try {
+        localStorage.setItem('voiceAnalyzerSessions', JSON.stringify(updatedSessions));
+        alert(`Sesión guardada como: ${sessionName}`);
+      } catch (storageError) {
+        console.error('Error saving to localStorage:', storageError);
+        alert('Error al guardar la sesión. El almacenamiento local puede estar lleno.');
+      }
+    } catch (error) {
+      console.error('Error saving session:', error);
+      alert('Error al guardar la sesión.');
+    }
   };
 
   const loadSession = (session: SavedSession) => {
-    setAnalysisData(session.data);
+    // Restore the session data
+    setAnalysisData({
+      ...session.data,
+      audioBlob: undefined // Audio blob is not stored, so it won't be available for playback
+    });
     setCurrentTranscription(session.data.transcription);
+    setIsPlaying(false);
+    setPlaybackTime(0);
   };
 
   const deleteSession = (sessionId: string) => {
-    const updatedSessions = savedSessions.filter(s => s.id !== sessionId);
-    setSavedSessions(updatedSessions);
-    localStorage.setItem('voiceAnalyzerSessions', JSON.stringify(updatedSessions));
+    try {
+      const updatedSessions = savedSessions.filter(s => s.id !== sessionId);
+      setSavedSessions(updatedSessions);
+      localStorage.setItem('voiceAnalyzerSessions', JSON.stringify(updatedSessions));
+    } catch (error) {
+      console.error('Error deleting session:', error);
+      alert('Error al eliminar la sesión.');
+    }
   };
 
   const exportSession = (session: SavedSession) => {
-    const dataStr = JSON.stringify(session, null, 2);
-    const dataBlob = new Blob([dataStr], { type: 'application/json' });
-    const url = URL.createObjectURL(dataBlob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${session.name}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
+    try {
+      const dataStr = JSON.stringify(session, null, 2);
+      const dataBlob = new Blob([dataStr], { type: 'application/json' });
+      const url = URL.createObjectURL(dataBlob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${session.name}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Error exporting session:', error);
+      alert('Error al exportar la sesión.');
+    }
   };
 
   const resetAnalysis = () => {
@@ -487,6 +537,7 @@ function App() {
                           ? 'bg-yellow-900 border-yellow-500 hover:bg-yellow-800 text-yellow-100'
                           : 'bg-blue-900 border-blue-500 hover:bg-blue-800 text-blue-100'
                       } shadow-lg shadow-blue-500/20`}
+                      title={isPlaying ? 'Pausar reproducción' : 'Reproducir audio grabado'}
                     >
                       {isPlaying ? <Pause size={20} /> : <Play size={20} />}
                     </button>
@@ -497,6 +548,7 @@ function App() {
                       <button
                         onClick={saveSession}
                         className="px-4 py-2 bg-purple-900 border border-purple-600 hover:bg-purple-800 text-purple-200 rounded-lg transition-colors flex items-center gap-2 font-mono text-sm"
+                        title="Guardar sesión actual"
                       >
                         <Save size={16} />
                         SAVE
@@ -504,6 +556,7 @@ function App() {
                       <button
                         onClick={resetAnalysis}
                         className="px-4 py-2 bg-gray-700 border border-gray-600 hover:bg-gray-600 text-gray-200 rounded-lg transition-colors flex items-center gap-2 font-mono text-sm"
+                        title="Limpiar análisis actual"
                       >
                         <RotateCcw size={16} />
                         RESET
@@ -771,9 +824,16 @@ function App() {
                       <button
                         onClick={() => loadSession(session)}
                         className="w-full px-3 py-1 bg-green-900 border border-green-700 hover:bg-green-800 text-green-300 rounded text-xs font-mono transition-colors"
+                        title="Cargar esta sesión"
                       >
                         LOAD_SESSION
                       </button>
+                      
+                      {session.data.audioBlob === undefined && (
+                        <p className="text-xs text-yellow-400 font-mono mt-1 text-center">
+                          ⚠ Audio no disponible
+                        </p>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -815,6 +875,8 @@ declare global {
   interface Window {
     SpeechRecognition: any;
     webkitSpeechRecognition: any;
+    AudioContext: any;
+    webkitAudioContext: any;
   }
 }
 
