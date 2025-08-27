@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Mic, MicOff, Play, Pause, RotateCcw, AlertTriangle, Volume2, BarChart3, Terminal, Code, Cpu, Activity, Save, Download, Trash2, Clock } from 'lucide-react';
+import { Mic, MicOff, Play, Pause, RotateCcw, AlertTriangle, Volume2, BarChart3, Terminal, Code, Cpu, Activity, Save, Download, Trash2, Clock, Upload, User, Users } from 'lucide-react';
 
 interface AnalysisData {
   transcription: string;
@@ -11,6 +11,13 @@ interface AnalysisData {
   audioBlob?: Blob;
   timestamp: number;
   id: string;
+  genderDetection: {
+    gender: 'male' | 'female' | 'unknown';
+    confidence: number;
+    fundamentalFreq: number;
+  };
+  source: 'recording' | 'upload';
+  fileName?: string;
 }
 
 interface SavedSession {
@@ -37,6 +44,7 @@ function App() {
   const [savedSessions, setSavedSessions] = useState<SavedSession[]>([]);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [playbackFrequencies, setPlaybackFrequencies] = useState<number[]>([]);
+  const [saveStatus, setSaveStatus] = useState<string>('');
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -50,12 +58,18 @@ function App() {
   const playbackAnalyserRef = useRef<AnalyserNode | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     // Load saved sessions from localStorage
-    const saved = localStorage.getItem('voiceAnalyzerSessions');
-    if (saved) {
-      setSavedSessions(JSON.parse(saved));
+    try {
+      const saved = localStorage.getItem('voiceAnalyzerSessions');
+      if (saved) {
+        const sessions = JSON.parse(saved);
+        setSavedSessions(sessions);
+      }
+    } catch (error) {
+      console.error('Error loading sessions:', error);
     }
 
     return () => {
@@ -64,6 +78,89 @@ function App() {
       stopRecording();
     };
   }, []);
+
+  const detectGender = (audioBuffer: AudioBuffer): { gender: 'male' | 'female' | 'unknown', confidence: number, fundamentalFreq: number } => {
+    const channelData = audioBuffer.getChannelData(0);
+    const sampleRate = audioBuffer.sampleRate;
+    
+    // Simple pitch detection using autocorrelation
+    const bufferSize = Math.min(4096, channelData.length);
+    const autocorrelation = new Array(bufferSize).fill(0);
+    
+    // Calculate autocorrelation
+    for (let lag = 0; lag < bufferSize; lag++) {
+      for (let i = 0; i < bufferSize - lag; i++) {
+        autocorrelation[lag] += channelData[i] * channelData[i + lag];
+      }
+    }
+    
+    // Find the peak (fundamental frequency)
+    let maxCorrelation = 0;
+    let bestLag = 0;
+    
+    for (let lag = 20; lag < bufferSize / 2; lag++) {
+      if (autocorrelation[lag] > maxCorrelation) {
+        maxCorrelation = autocorrelation[lag];
+        bestLag = lag;
+      }
+    }
+    
+    const fundamentalFreq = bestLag > 0 ? sampleRate / bestLag : 0;
+    
+    // Gender classification based on fundamental frequency
+    let gender: 'male' | 'female' | 'unknown' = 'unknown';
+    let confidence = 0;
+    
+    if (fundamentalFreq > 0) {
+      if (fundamentalFreq >= 165 && fundamentalFreq <= 265) {
+        // Typical female range
+        gender = 'female';
+        confidence = Math.min(0.9, (fundamentalFreq - 165) / 100 * 0.5 + 0.4);
+      } else if (fundamentalFreq >= 85 && fundamentalFreq <= 180) {
+        // Typical male range
+        gender = 'male';
+        confidence = Math.min(0.9, (180 - fundamentalFreq) / 95 * 0.5 + 0.4);
+      } else {
+        confidence = 0.3;
+      }
+    }
+    
+    return { gender, confidence, fundamentalFreq };
+  };
+
+  const analyzeAudioBuffer = async (audioBuffer: AudioBuffer, source: 'recording' | 'upload', fileName?: string) => {
+    const genderDetection = detectGender(audioBuffer);
+    
+    // Generate frequency data from audio buffer
+    const frequencyData = Array.from({ length: 50 }, (_, i) => {
+      const freq = (i / 50) * (audioBuffer.sampleRate / 2);
+      return Math.random() * 80 + 20; // Simulated for demo
+    });
+
+    const audioBlob = audioChunksRef.current.length > 0 
+      ? new Blob(audioChunksRef.current, { type: 'audio/webm' })
+      : undefined;
+
+    const analysis: AnalysisData = {
+      transcription: currentTranscription,
+      offensiveWords: currentTranscription.toLowerCase().split(/\s+/).filter(word => 
+        OFFENSIVE_WORDS.some(offensive => word.includes(offensive.toLowerCase()))
+      ),
+      wordCount: currentTranscription.split(/\s+/).filter(word => word.length > 0).length,
+      duration: audioBuffer.duration,
+      averageVolume: audioLevel,
+      frequencyData,
+      audioBlob,
+      timestamp: Date.now(),
+      id: Date.now().toString(),
+      genderDetection,
+      source,
+      fileName
+    };
+
+    setAnalysisData(analysis);
+    setIsAnalyzing(false);
+  };
 
   const startRecording = async () => {
     try {
@@ -75,11 +172,10 @@ function App() {
         } 
       });
 
-      // Reset audio chunks
       audioChunksRef.current = [];
-
-      // Setup MediaRecorder
-      mediaRecorderRef.current = new MediaRecorder(stream);
+      mediaRecorderRef.current = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus'
+      });
 
       mediaRecorderRef.current.ondataavailable = (event) => {
         if (event.data.size > 0) {
@@ -87,15 +183,45 @@ function App() {
         }
       };
 
-      mediaRecorderRef.current.onstop = () => {
+      mediaRecorderRef.current.onstop = async () => {
         if (audioChunksRef.current.length > 0) {
           const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-          setAnalysisData(prev => prev ? { ...prev, audioBlob } : null);
+          
+          // Convert blob to audio buffer for analysis
+          const arrayBuffer = await audioBlob.arrayBuffer();
+          const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          
+          try {
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            await analyzeAudioBuffer(audioBuffer, 'recording');
+          } catch (error) {
+            console.error('Error decoding audio:', error);
+            // Fallback analysis without audio buffer
+            const analysis: AnalysisData = {
+              transcription: currentTranscription,
+              offensiveWords: currentTranscription.toLowerCase().split(/\s+/).filter(word => 
+                OFFENSIVE_WORDS.some(offensive => word.includes(offensive.toLowerCase()))
+              ),
+              wordCount: currentTranscription.split(/\s+/).filter(word => word.length > 0).length,
+              duration: recordingTime,
+              averageVolume: audioLevel,
+              frequencyData: Array.from({ length: 50 }, () => Math.random() * 100),
+              audioBlob,
+              timestamp: Date.now(),
+              id: Date.now().toString(),
+              genderDetection: { gender: 'unknown', confidence: 0, fundamentalFreq: 0 },
+              source: 'recording'
+            };
+            setAnalysisData(analysis);
+            setIsAnalyzing(false);
+          }
+          
+          await audioContext.close();
         }
       };
 
       // Setup Audio Context for real-time analysis
-      audioContextRef.current = new AudioContext();
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
       const source = audioContextRef.current.createMediaStreamSource(stream);
       analyserRef.current = audioContextRef.current.createAnalyser();
       analyserRef.current.fftSize = 256;
@@ -130,18 +256,81 @@ function App() {
       setRecordingTime(0);
       setCurrentTranscription('');
 
-      // Start timer
       intervalRef.current = setInterval(() => {
         setRecordingTime(prev => prev + 1);
       }, 1000);
 
-      // Start audio level monitoring
       monitorAudioLevel();
 
     } catch (error) {
       console.error('Error accessing microphone:', error);
       alert('No se pudo acceder al micrófono. Verifica los permisos.');
     }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+      setIsAnalyzing(true);
+
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+      }
+
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+      }
+
+      // Stop all tracks
+      if (mediaRecorderRef.current.stream) {
+        mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+      }
+    }
+  };
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith('audio/')) {
+      alert('Por favor selecciona un archivo de audio válido.');
+      return;
+    }
+
+    setIsAnalyzing(true);
+    setCurrentTranscription('Analizando archivo subido...');
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      
+      // Store the file as blob for playback
+      audioChunksRef.current = [file];
+      
+      // Simulate transcription for uploaded files (in real app, you'd use a service)
+      setCurrentTranscription(`Archivo analizado: ${file.name} - Duración: ${audioBuffer.duration.toFixed(2)}s`);
+      
+      await analyzeAudioBuffer(audioBuffer, 'upload', file.name);
+      await audioContext.close();
+      
+    } catch (error) {
+      console.error('Error processing uploaded file:', error);
+      alert('Error al procesar el archivo de audio. Verifica que sea un formato compatible.');
+      setIsAnalyzing(false);
+    }
+
+    // Reset file input
+    event.target.value = '';
   };
 
   const monitorAudioLevel = () => {
@@ -153,7 +342,6 @@ function App() {
         if (analyserRef.current && isRecording) {
           analyserRef.current.getByteFrequencyData(dataArray);
           
-          // Calculate average volume
           let sum = 0;
           for (let i = 0; i < bufferLength; i++) {
             sum += dataArray[i];
@@ -161,7 +349,6 @@ function App() {
           const average = sum / bufferLength;
           setAudioLevel(average / 255);
 
-          // Draw frequency visualization
           drawFrequencyBars(dataArray, canvasRef.current);
           
           animationRef.current = requestAnimationFrame(updateLevel);
@@ -188,14 +375,13 @@ function App() {
     for (let i = 0; i < dataArray.length; i++) {
       const barHeight = (dataArray[i] / 255) * height;
       
-      // Matrix-style green to cyan gradient
       const intensity = dataArray[i] / 255;
       if (intensity > 0.7) {
-        ctx.fillStyle = '#00ffff'; // Cyan for high frequencies
+        ctx.fillStyle = '#00ffff';
       } else if (intensity > 0.4) {
-        ctx.fillStyle = '#00ff00'; // Green for medium frequencies
+        ctx.fillStyle = '#00ff00';
       } else {
-        ctx.fillStyle = '#004400'; // Dark green for low frequencies
+        ctx.fillStyle = '#004400';
       }
       ctx.fillRect(x, height - barHeight, barWidth, barHeight);
       
@@ -203,69 +389,10 @@ function App() {
     }
   };
 
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      setIsAnalyzing(true);
-
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
-      }
-
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
-
-      if (animationRef.current) {
-        cancelAnimationFrame(animationRef.current);
-      }
-
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-
-      // Analyze the recording
-      setTimeout(() => {
-        analyzeRecording();
-      }, 500);
-    }
-  };
-
-  const analyzeRecording = () => {
-    const words = currentTranscription.toLowerCase().split(/\s+/).filter(word => word.length > 0);
-    const detectedOffensiveWords = words.filter(word => 
-      OFFENSIVE_WORDS.some(offensive => word.includes(offensive.toLowerCase()))
-    );
-
-    // Generate frequency data (simulated for demo)
-    const frequencyData = Array.from({ length: 50 }, () => Math.random() * 100);
-
-    const audioBlob = audioChunksRef.current.length > 0 
-      ? new Blob(audioChunksRef.current, { type: 'audio/webm' })
-      : undefined;
-
-    const analysis: AnalysisData = {
-      transcription: currentTranscription,
-      offensiveWords: detectedOffensiveWords,
-      wordCount: words.length,
-      duration: recordingTime,
-      averageVolume: audioLevel,
-      frequencyData,
-      audioBlob,
-      timestamp: Date.now(),
-      id: Date.now().toString()
-    };
-
-    setAnalysisData(analysis);
-    setIsAnalyzing(false);
-  };
-
   const playAudio = async () => {
-    if (!analysisData?.audioBlob) return;
+    if (!analysisData?.audioBlob && audioChunksRef.current.length === 0) return;
 
     if (isPlaying) {
-      // Stop playback
       if (audioRef.current) {
         audioRef.current.pause();
         audioRef.current.currentTime = 0;
@@ -279,20 +406,17 @@ function App() {
     }
 
     try {
-      // Create audio element
-      const audioUrl = URL.createObjectURL(analysisData.audioBlob);
+      const audioBlob = analysisData?.audioBlob || new Blob(audioChunksRef.current, { type: 'audio/webm' });
+      const audioUrl = URL.createObjectURL(audioBlob);
       
-      // Create new audio element each time to avoid issues
       audioRef.current = new Audio(audioUrl);
 
-      // Setup audio context for playback visualization
       if (playbackContextRef.current) {
         await playbackContextRef.current.close();
       }
       
       playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
       
-      // Resume context if suspended
       if (playbackContextRef.current.state === 'suspended') {
         await playbackContextRef.current.resume();
       }
@@ -319,19 +443,18 @@ function App() {
       audioRef.current.onerror = (error) => {
         console.error('Audio playback error:', error);
         setIsPlaying(false);
-        alert('Error al reproducir el audio. Intenta grabar de nuevo.');
+        alert('Error al reproducir el audio.');
       };
 
       await audioRef.current.play();
       setIsPlaying(true);
 
-      // Start playback visualization
       monitorPlaybackFrequencies();
 
     } catch (error) {
       console.error('Error playing audio:', error);
       setIsPlaying(false);
-      alert('No se pudo reproducir el audio. Verifica que el navegador soporte la reproducción.');
+      alert('No se pudo reproducir el audio.');
     }
   };
 
@@ -344,10 +467,8 @@ function App() {
         if (playbackAnalyserRef.current && isPlaying) {
           playbackAnalyserRef.current.getByteFrequencyData(dataArray);
           
-          // Draw frequency visualization for playback
           drawFrequencyBars(dataArray, playbackCanvasRef.current);
           
-          // Update frequency data for display
           const frequencies = Array.from(dataArray).map(val => (val / 255) * 100);
           setPlaybackFrequencies(frequencies);
           
@@ -365,10 +486,9 @@ function App() {
       const now = new Date();
       const sessionName = `Session_${now.getDate().toString().padStart(2, '0')}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getFullYear()}_${now.getHours().toString().padStart(2, '0')}-${now.getMinutes().toString().padStart(2, '0')}`;
 
-      // Create a copy of analysis data without the audio blob for storage
       const dataForStorage = {
         ...analysisData,
-        audioBlob: undefined // Remove blob to avoid storage issues
+        audioBlob: undefined
       };
 
       const newSession: SavedSession = {
@@ -381,39 +501,36 @@ function App() {
       const updatedSessions = [...savedSessions, newSession];
       setSavedSessions(updatedSessions);
       
-      // Save to localStorage with error handling
-      try {
-        localStorage.setItem('voiceAnalyzerSessions', JSON.stringify(updatedSessions));
-        alert(`Sesión guardada como: ${sessionName}`);
-      } catch (storageError) {
-        console.error('Error saving to localStorage:', storageError);
-        alert('Error al guardar la sesión. El almacenamiento local puede estar lleno.');
-      }
+      localStorage.setItem('voiceAnalyzerSessions', JSON.stringify(updatedSessions));
+      
+      setSaveStatus('✅ Sesión guardada correctamente');
+      setTimeout(() => setSaveStatus(''), 3000);
+      
     } catch (error) {
       console.error('Error saving session:', error);
-      alert('Error al guardar la sesión.');
+      setSaveStatus('❌ Error al guardar la sesión');
+      setTimeout(() => setSaveStatus(''), 3000);
     }
   };
 
   const loadSession = (session: SavedSession) => {
-    // Restore the session data
-    setAnalysisData({
-      ...session.data,
-      audioBlob: undefined // Audio blob is not stored, so it won't be available for playback
-    });
+    setAnalysisData(session.data);
     setCurrentTranscription(session.data.transcription);
     setIsPlaying(false);
     setPlaybackTime(0);
+    audioChunksRef.current = [];
   };
 
   const deleteSession = (sessionId: string) => {
-    try {
-      const updatedSessions = savedSessions.filter(s => s.id !== sessionId);
-      setSavedSessions(updatedSessions);
-      localStorage.setItem('voiceAnalyzerSessions', JSON.stringify(updatedSessions));
-    } catch (error) {
-      console.error('Error deleting session:', error);
-      alert('Error al eliminar la sesión.');
+    if (confirm('¿Estás seguro de que quieres eliminar esta sesión?')) {
+      try {
+        const updatedSessions = savedSessions.filter(s => s.id !== sessionId);
+        setSavedSessions(updatedSessions);
+        localStorage.setItem('voiceAnalyzerSessions', JSON.stringify(updatedSessions));
+      } catch (error) {
+        console.error('Error deleting session:', error);
+        alert('Error al eliminar la sesión.');
+      }
     }
   };
 
@@ -442,6 +559,8 @@ function App() {
     setAudioLevel(0);
     setPlaybackTime(0);
     setIsPlaying(false);
+    setSaveStatus('');
+    audioChunksRef.current = [];
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
@@ -454,6 +573,22 @@ function App() {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  const getGenderIcon = (gender: string) => {
+    switch (gender) {
+      case 'male': return <User className="text-blue-400" size={16} />;
+      case 'female': return <Users className="text-pink-400" size={16} />;
+      default: return <User className="text-gray-400" size={16} />;
+    }
+  };
+
+  const getGenderColor = (gender: string) => {
+    switch (gender) {
+      case 'male': return 'text-blue-400';
+      case 'female': return 'text-pink-400';
+      default: return 'text-gray-400';
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-slate-900 to-black">
       <div className="container mx-auto px-4 py-8 max-w-7xl">
@@ -461,10 +596,10 @@ function App() {
         <div className="text-center mb-8">
           <h1 className="text-4xl font-bold text-green-400 mb-2 flex items-center justify-center gap-3 font-mono">
             <Terminal className="text-cyan-400" />
-            voice_analyzer.exe v3.0
+            voice_analyzer.exe v4.0
           </h1>
           <p className="text-gray-400 font-mono text-sm">
-            <span className="text-cyan-400">$</span> Real-time audio processing & session management toolkit
+            <span className="text-cyan-400">$</span> Real-time audio processing, gender detection & file upload toolkit
           </p>
           <div className="flex justify-center items-center gap-4 mt-4">
             <div className="flex items-center gap-2 text-xs text-gray-500 font-mono">
@@ -491,7 +626,6 @@ function App() {
           <div className="xl:col-span-3 space-y-6">
             {/* Recording Controls */}
             <div className="bg-gray-800 border border-gray-700 rounded-xl shadow-2xl p-6 relative overflow-hidden">
-              {/* Matrix-style background effect */}
               <div className="absolute inset-0 opacity-5">
                 <div className="text-green-400 font-mono text-xs leading-none">
                   {Array.from({ length: 20 }, (_, i) => (
@@ -505,15 +639,15 @@ function App() {
               <div className="flex flex-col items-center space-y-4">
                 <div className="text-center mb-4">
                   <p className="text-green-400 font-mono text-sm mb-1">
-                    {'>'} AUDIO_INTERFACE_v3.0.0
+                    {'>'} AUDIO_INTERFACE_v4.0.0
                   </p>
                   <div className="flex justify-center gap-4 text-xs font-mono">
                     <span className="text-gray-400">STATUS: <span className={isRecording ? 'text-red-400' : 'text-green-400'}>{isRecording ? 'RECORDING' : 'IDLE'}</span></span>
-                    <span className="text-gray-400">MODE: <span className="text-cyan-400">REALTIME</span></span>
+                    <span className="text-gray-400">MODE: <span className="text-cyan-400">ENHANCED</span></span>
                   </div>
                 </div>
                 
-                <div className="flex items-center space-x-4">
+                <div className="flex items-center space-x-4 flex-wrap justify-center">
                   <button
                     onClick={isRecording ? stopRecording : startRecording}
                     disabled={isAnalyzing}
@@ -522,14 +656,32 @@ function App() {
                         ? 'bg-red-900 border-red-500 hover:bg-red-800 animate-pulse text-red-100'
                         : 'bg-green-900 border-green-500 hover:bg-green-800 hover:scale-105 text-green-100'
                     } disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-green-500/20`}
+                    title={isRecording ? 'Detener grabación' : 'Iniciar grabación'}
                   >
                     {isRecording ? <MicOff size={28} /> : <Mic size={28} />}
                     {isRecording && (
                       <div className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full animate-ping"></div>
                     )}
                   </button>
+
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handleFileUpload}
+                    accept="audio/*"
+                    className="hidden"
+                  />
                   
-                  {analysisData?.audioBlob && (
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isRecording || isAnalyzing}
+                    className="w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300 border-2 font-mono text-sm bg-orange-900 border-orange-500 hover:bg-orange-800 text-orange-100 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-orange-500/20"
+                    title="Subir archivo de audio"
+                  >
+                    <Upload size={20} />
+                  </button>
+                  
+                  {(analysisData?.audioBlob || audioChunksRef.current.length > 0) && (
                     <button
                       onClick={playAudio}
                       className={`w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300 border-2 font-mono text-sm ${
@@ -537,7 +689,7 @@ function App() {
                           ? 'bg-yellow-900 border-yellow-500 hover:bg-yellow-800 text-yellow-100'
                           : 'bg-blue-900 border-blue-500 hover:bg-blue-800 text-blue-100'
                       } shadow-lg shadow-blue-500/20`}
-                      title={isPlaying ? 'Pausar reproducción' : 'Reproducir audio grabado'}
+                      title={isPlaying ? 'Pausar reproducción' : 'Reproducir audio'}
                     >
                       {isPlaying ? <Pause size={20} /> : <Play size={20} />}
                     </button>
@@ -547,7 +699,7 @@ function App() {
                     <>
                       <button
                         onClick={saveSession}
-                        className="px-4 py-2 bg-purple-900 border border-purple-600 hover:bg-purple-800 text-purple-200 rounded-lg transition-colors flex items-center gap-2 font-mono text-sm"
+                        className="px-6 py-3 bg-purple-900 border border-purple-600 hover:bg-purple-800 text-purple-200 rounded-lg transition-colors flex items-center gap-2 font-mono text-sm shadow-lg hover:shadow-purple-500/20"
                         title="Guardar sesión actual"
                       >
                         <Save size={16} />
@@ -555,7 +707,7 @@ function App() {
                       </button>
                       <button
                         onClick={resetAnalysis}
-                        className="px-4 py-2 bg-gray-700 border border-gray-600 hover:bg-gray-600 text-gray-200 rounded-lg transition-colors flex items-center gap-2 font-mono text-sm"
+                        className="px-6 py-3 bg-gray-700 border border-gray-600 hover:bg-gray-600 text-gray-200 rounded-lg transition-colors flex items-center gap-2 font-mono text-sm shadow-lg"
                         title="Limpiar análisis actual"
                       >
                         <RotateCcw size={16} />
@@ -564,6 +716,13 @@ function App() {
                     </>
                   )}
                 </div>
+
+                {/* Save Status */}
+                {saveStatus && (
+                  <div className="text-center">
+                    <p className="text-sm font-mono font-semibold">{saveStatus}</p>
+                  </div>
+                )}
 
                 {/* Recording Status */}
                 <div className="text-center">
@@ -674,16 +833,63 @@ function App() {
                         <p className="text-2xl font-bold text-green-300 font-mono">{formatTime(analysisData.duration)}</p>
                       </div>
                     </div>
+
+                    {/* Source Info */}
+                    <div className="bg-gray-900/50 border border-gray-600 rounded-lg p-3">
+                      <p className="text-gray-400 font-semibold font-mono text-xs mb-1">SOURCE</p>
+                      <p className="text-cyan-400 font-mono text-sm">
+                        {analysisData.source === 'recording' ? '🎤 MICROPHONE' : '📁 FILE_UPLOAD'}
+                        {analysisData.fileName && ` - ${analysisData.fileName}`}
+                      </p>
+                    </div>
                   </div>
                 </div>
 
-                {/* Offensive Words Panel */}
+                {/* Gender Detection & Offensive Words Panel */}
                 <div className="bg-gray-800 border border-gray-700 rounded-xl shadow-2xl p-6">
                   <h3 className="text-lg font-semibold mb-4 flex items-center gap-2 text-green-400 font-mono">
                     <AlertTriangle className="text-red-400" size={20} />
-                    content_filter.exe
+                    voice_analysis.exe
                   </h3>
                   <div className="space-y-4">
+                    {/* Gender Detection */}
+                    <div className="bg-black border border-gray-600 rounded-lg p-4">
+                      <h4 className="font-semibold text-green-400 mb-3 font-mono text-sm flex items-center gap-2">
+                        {getGenderIcon(analysisData.genderDetection.gender)}
+                        GENDER_DETECTION:
+                      </h4>
+                      <div className="space-y-2">
+                        <div className="flex justify-between items-center">
+                          <span className="text-gray-400 font-mono text-sm">Detected:</span>
+                          <span className={`font-mono text-sm font-bold ${getGenderColor(analysisData.genderDetection.gender)}`}>
+                            {analysisData.genderDetection.gender.toUpperCase()}
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-gray-400 font-mono text-sm">Confidence:</span>
+                          <span className="font-mono text-sm text-cyan-400">
+                            {(analysisData.genderDetection.confidence * 100).toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-gray-400 font-mono text-sm">Pitch (Hz):</span>
+                          <span className="font-mono text-sm text-yellow-400">
+                            {analysisData.genderDetection.fundamentalFreq.toFixed(1)}
+                          </span>
+                        </div>
+                        <div className="w-full bg-gray-700 rounded-full h-2 mt-2">
+                          <div 
+                            className={`h-2 rounded-full transition-all duration-300 ${
+                              analysisData.genderDetection.gender === 'male' ? 'bg-blue-500' :
+                              analysisData.genderDetection.gender === 'female' ? 'bg-pink-500' : 'bg-gray-500'
+                            }`}
+                            style={{ width: `${analysisData.genderDetection.confidence * 100}%` }}
+                          ></div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Content Filter */}
                     <div className={`p-4 rounded-lg border font-mono ${
                       analysisData.offensiveWords.length > 0 
                         ? 'bg-red-900/20 border-red-700' 
@@ -698,7 +904,7 @@ function App() {
                         }`}>
                           {analysisData.offensiveWords.length > 0 
                             ? `THREAT_LEVEL: HIGH [${analysisData.offensiveWords.length} DETECTED]`
-                            : 'STATUS: CLEAN [0x00]'
+                            : 'CONTENT: CLEAN [0x00]'
                           }
                         </span>
                       </div>
@@ -819,6 +1025,17 @@ function App() {
                             {new Date(session.timestamp).toLocaleDateString()}
                           </span>
                         </div>
+                        <div className="flex justify-between mt-1">
+                          <span className="flex items-center gap-1">
+                            {getGenderIcon(session.data.genderDetection.gender)}
+                            <span className={getGenderColor(session.data.genderDetection.gender)}>
+                              {session.data.genderDetection.gender}
+                            </span>
+                          </span>
+                          <span className="text-gray-500">
+                            {session.data.source === 'recording' ? '🎤' : '📁'}
+                          </span>
+                        </div>
                       </div>
                       
                       <button
@@ -828,12 +1045,6 @@ function App() {
                       >
                         LOAD_SESSION
                       </button>
-                      
-                      {session.data.audioBlob === undefined && (
-                        <p className="text-xs text-yellow-400 font-mono mt-1 text-center">
-                          ⚠ Audio no disponible
-                        </p>
-                      )}
                     </div>
                   ))}
                 </div>
@@ -850,18 +1061,20 @@ function App() {
               README.md
             </h3>
             <div className="text-gray-300 space-y-2 font-mono text-sm text-left max-w-2xl mx-auto">
-              <p className="text-gray-400"># Voice Analyzer v3.0 Usage</p>
+              <p className="text-gray-400"># Voice Analyzer v4.0 Usage</p>
               <p><span className="text-cyan-400">1.</span> Click the microphone button to start recording</p>
-              <p><span className="text-cyan-400">2.</span> Speak clearly into your microphone</p>
-              <p><span className="text-cyan-400">3.</span> Click again to stop and process audio</p>
-              <p><span className="text-cyan-400">4.</span> Use play button to replay recorded audio</p>
-              <p><span className="text-cyan-400">5.</span> Save sessions for later analysis</p>
-              <p><span className="text-cyan-400">6.</span> Load previous sessions from sidebar</p>
-              <p className="text-gray-500 mt-4">## New Features v3.0</p>
-              <p className="text-gray-400">- Session persistence with localStorage</p>
-              <p className="text-gray-400">- Audio playback with dynamic frequencies</p>
-              <p className="text-gray-400">- Export/Import session data</p>
+              <p><span className="text-cyan-400">2.</span> OR click upload button to analyze audio files</p>
+              <p><span className="text-cyan-400">3.</span> Speak clearly into your microphone</p>
+              <p><span className="text-cyan-400">4.</span> Click again to stop and process audio</p>
+              <p><span className="text-cyan-400">5.</span> Use play button to replay recorded audio</p>
+              <p><span className="text-cyan-400">6.</span> Click SAVE button to store sessions</p>
+              <p><span className="text-cyan-400">7.</span> Load previous sessions from sidebar</p>
+              <p className="text-gray-500 mt-4">## New Features v4.0</p>
+              <p className="text-gray-400">- Gender detection with confidence levels</p>
+              <p className="text-gray-400">- Audio file upload support</p>
               <p className="text-gray-400">- Enhanced session management</p>
+              <p className="text-gray-400">- Improved save functionality</p>
+              <p className="text-gray-400">- Voice pitch analysis</p>
             </div>
           </div>
         )}
